@@ -26,3 +26,34 @@ message ValidateResponse {
 
 message SyncRequest { }
 message SyncResponse { }
+
+// New messages for DASD
+service DASDService {
+    rpc ValidateV2 (ValidateRequestV2) returns (ValidateResponseV2);
+}
+
+message Bundle {
+  string seq_id = 1;
+  uint64 bundle_id = 2;
+  uint32 start_pos = 3;
+  uint32 len = 4;       // W
+  bytes prefix_hash = 5;
+  repeated uint32 token_ids = 6; // candidate tokens
+  bytes qlogp_i8 = 7;
+  uint32 credit_left = 8;
+  uint32 flags = 9;     // reserved for future (e.g., draft policy)
+}
+
+message ValidateRequestV2 {
+  string seq_id = 1;
+  repeated Bundle bundles = 2; // allow micro-batching multiple bundles per call
+}
+
+message ValidateResponseV2 {
+  string seq_id = 1;
+  uint64 ack_bundle_id = 2; // last bundle id processed for this reply
+  uint32 last_accepted_pos = 3;
+  bytes accept_bitmap = 4;
+  uint32 next_credit = 5; // server-assigned next credit (AIMD)
+  bytes hint_mask = 6;  // optional PAS Top-M mask (can be empty)
+}

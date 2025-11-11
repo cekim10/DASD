@@ -11,7 +11,20 @@ import log
 import util
 from config import SpecEdgeBatchServerConfig as config
 from specedge_grpc import specedge_pb2_grpc
-from strategy.server_verify.specexec.grpc import SpecExecBatchServer
+
+try:
+    from specedge_grpc import specedge_pb2_grpc as dasd_pb2_grpc
+except Exception:
+    dasd_pb2_grpc = specedge_pb2_grpc
+
+# Legacy controller
+from strategy.server_verify.specexec.grpc_legacy import SpecExecBatchServer
+
+try:
+    from strategy.server_verify.specexec.grpc_dasd import SpecExecDasdServer
+except Exception:
+    class SpecExecDasdServer(SpecExecBatchServer):
+        pass
 
 shutdown_event = None
 
@@ -26,10 +39,17 @@ async def serve():
     global shutdown_event
 
     shutdown_event = asyncio.Event()
-    controller = SpecExecBatchServer(shutdown_event=shutdown_event)
+
+    # controllers
+    controller_v1 = SpecExecBatchServer(shutdown_event=shutdown_event)
+    controller_v2 = SpecExecDasdServer(shutdown_event=shutdown_event)
 
     server = grpc.aio.server()
-    specedge_pb2_grpc.add_SpecEdgeServiceServicer_to_server(controller, server)
+    # Legacy service
+    specedge_pb2_grpc.add_SpecEdgeServiceServicer_to_server(controller_v1, server)
+    # NEW: DASD (V2) service
+    dasd_pb2_grpc.add_DASDServiceServicer_to_server(controller_v2, server)
+
     server.add_insecure_port("[::]:8000")
 
     try:
@@ -37,7 +57,9 @@ async def serve():
         await shutdown_event.wait()
 
         await server.stop(grace=2.0)
-        await controller.cleanup()
+        await controller_v1.cleanup()
+        if controller_v2 is not controller_v1:
+            await controller_v2.cleanup()
 
     except asyncio.CancelledError:
         await server.stop(0)
@@ -46,11 +68,18 @@ async def serve():
         await server.stop(0)
         raise
 
+def _as_bool(x, default=False):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        return x.lower() in ("1", "true", "yes", "on")
+    return default
 
 def _load_config(config_file: Path):
     with open(config_file, "r") as f:
         config_yaml = yaml.safe_load(f)
 
+    # ----- required (legacy) -----
     result_path = config_yaml["base"]["result_path"]
     exp_name = config_yaml["base"]["exp_name"]
     process_name = "server"
@@ -72,6 +101,25 @@ def _load_config(config_file: Path):
     num_clients = config_yaml["server"]["num_clients"]
     cache_prefill = config_yaml["server"]["cache_prefill"]
 
+    # ----- new (optional) DASD server block -----
+    dasd = config_yaml["server"]["dasd"]
+    dasd_enable = _as_bool(dasd["enable"])
+    tick_ms = dasd["tick_ms"]
+
+    aimd = dasd["aimd"]
+    aimd_r_target = aimd["r_target"]
+    aimd_inc = aimd["inc"]
+    aimd_dec_factor = aimd["dec_factor"]
+    aimd_min_credit = aimd["min_credit"]
+    aimd_max_credit = aimd["max_credit"]
+
+    pas = dasd["pas"]
+    pas_enable = pas["enable"]
+    pas_top_m = pas["top_m"]
+    pas_broadcast_every = pas["broadcast_every"]
+    pas_ttl = pas["ttl"]
+
+    # ----- export env (legacy) -----
     os.environ["SPECEDGE_RESULT_PATH"] = result_path
     os.environ["SPECEDGE_EXP_NAME"] = exp_name
     os.environ["SPECEDGE_PROCESS_NAME"] = process_name
@@ -94,6 +142,22 @@ def _load_config(config_file: Path):
     os.environ["SPECEDGE_NUM_CLIENTS"] = str(num_clients)
     os.environ["SPECEDGE_CACHE_PREFILL"] = str(cache_prefill)
 
+    # ----- export env (NEW: DASD) -----
+    os.environ["DASD_ENABLE"] = "1" if dasd_enable else "0"
+    os.environ["DASD_TICK_MS"] = str(tick_ms)
+
+    os.environ["DASD_AIMD_R_TARGET"] = str(aimd_r_target)
+    os.environ["DASD_AIMD_INC"] = str(aimd_inc)
+    os.environ["DASD_AIMD_DEC_FACTOR"] = str(aimd_dec_factor)
+    os.environ["DASD_AIMD_MIN_CREDIT"] = str(aimd_min_credit)
+    os.environ["DASD_AIMD_MAX_CREDIT"] = str(aimd_max_credit)
+
+    os.environ["DASD_PAS_ENABLE"] = "1" if pas_enable else "0"
+    os.environ["DASD_PAS_TOP_M"] = str(pas_top_m)
+    os.environ["DASD_PAS_BROADCAST_EVERY"] = str(pas_broadcast_every)
+    os.environ["DASD_PAS_TTL"] = str(pas_ttl)
+
+    # ----- logging -----
     log_config = log.get_default_log_config(
         Path(config.result_path) / config.exp_name, "server"
     )
@@ -114,7 +178,18 @@ def _load_config(config_file: Path):
     logger.debug("max_batch_size: %s", max_batch_size)
     logger.debug("max_n_beams: %s", max_n_beams)
     logger.debug("max_budget: %s", max_budget)
+    logger.debug("num_clients: %s", num_clients)
+    logger.debug("cache_prefill: %s", cache_prefill)
     logger.info("Config loaded successfully.")
+
+    # NEW: show DASD block (info level so you can verify quickly)
+    logger.info(
+        "DASD: enable=%s tick_ms=%s aimd(r*=%.2f, +%d, x%.2f, min=%d, max=%d) "
+        "pas(enable=%s, top_m=%d, every=%d, ttl=%d)",
+        dasd_enable, tick_ms, aimd_r_target, aimd_inc, aimd_dec_factor,
+        aimd_min_credit, aimd_max_credit,
+        pas_enable, pas_top_m, pas_broadcast_every, pas_ttl
+    )
 
 
 if __name__ == "__main__":
