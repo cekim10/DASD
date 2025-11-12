@@ -85,6 +85,7 @@ class SpecExecBatchServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         return specedge_pb2.SyncResponse()
 
     async def Validate(self, request, context):
+        self._logger.warning("[LEGACY] Validate() hit! client=%s req=%s", request.client_idx, request.req_idx)
         self._logger.info("Received request: %s", request.client_idx)
         fut = asyncio.Future()
 

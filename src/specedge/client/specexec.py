@@ -1,5 +1,6 @@
+import os
 import asyncio
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -8,7 +9,8 @@ import log
 import util
 from config import SpecEdgeClientConfig as config
 from specedge.client.proactive import SpecExecProactiveDraft
-from specedge.network.grpc import GrpcClientController
+from specedge.network.grpc import get_grpc_client
+from specedge_grpc import specedge_pb2
 from specedge.tree import Tree
 
 
@@ -51,10 +53,18 @@ class SpecExecClient:
         self._tokenizer = tokenizer
         self._engine.reset()
 
+        # ---- Proper prompt init (chat template if available) ----
+        if getattr(self._tokenizer, "apply_chat_template", None) is not None:
+            messages = [{"role": "user", "content": prompt}]
+            prefix_tokens = self._tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            )
+        else:
+            prefix_tokens = self._tokenizer.encode(
+                prompt, add_special_tokens=True, return_tensors="pt"
+            )
         self._prompt = prompt
-        self._prefix_tokens = self._tokenizer.encode(prompt, return_tensors="pt").to(
-            self._device
-        )[: config.max_len]
+        self._prefix_tokens = prefix_tokens.to(self._device)[:, : config.max_len]
         self._num_original_tokens = self._prefix_tokens.numel()
         self._max_len = max_len
 
@@ -64,7 +74,19 @@ class SpecExecClient:
             dtype=self._dtype,
             max_len=self._engine.max_len,
         )
-        self._validator = GrpcClientController(host=config.host, device=self._device)
+
+        # feature flag + DASD runtime knobs
+        self._use_v2 = os.getenv("DASD_ENABLE", "0") == "1"
+        self._logger.info(f"use_v2? {self._use_v2}")
+        self._seq_id = f"c{config.client_idx}_req"
+        self._bundle_id = 0
+        self._credit = int(os.getenv("DASD_AIMD_MIN_CREDIT", "4"))
+        self._max_bundle_len = self._credit
+
+        self._validator = get_grpc_client(self._use_v2, config.host, self._device)
+
+        self._t2_single = os.getenv("SPECEDGE_T2_SINGLE_CAND", "0") == "1"
+        self._t2_toggle = 0  # flip 0/1 each step
 
         self._proactive_client: Optional[SpecExecProactiveDraft] = None
         if self._proactive_type != "disabled":
@@ -73,24 +95,18 @@ class SpecExecClient:
                 engine=self._engine,
                 max_len=self._max_len,
             )
-
-            # Whether Proactive Draft was executed in the previous iter
             self._previous_proactive_draft = False
-
-            # Whether Proactive Draft is executed in the current iter
             self._proactive_draft = False
 
     def _verify_configs(self):
         if self._proactive_type not in ["included", "excluded", "disabled"]:
             raise ValueError(f"Invalid proactive_type: {self._proactive_type}")
 
+    # ---------------- Core public API ----------------
+
     async def generate(self, req_idx: int):
-        """
-        Generate a sequence using SpecExec up to max_new_tokens.
-        """
-
+        """Generate a sequence up to max_new_tokens."""
         self._logger.info("Generating sequence req_idx=%d", req_idx)
-
         util.set_seed(config.seed)
         step_idx = 0
 
@@ -102,7 +118,7 @@ class SpecExecClient:
         step_idx = 1
         eos_flag = False
 
-        # speculative decoding phase
+        # Speculative decoding phase
         while (
             self._prefix_tokens.numel()
             < self._max_new_tokens + self._num_original_tokens + warmup_tokens.numel()
@@ -111,7 +127,10 @@ class SpecExecClient:
             self._logger.debug(
                 "Speculative Decoding phase: req_idx=%d, step_idx=%d", req_idx, step_idx
             )
-            fresh_tokens = await self._cycle(req_idx, step_idx)
+            if self._use_v2:
+                fresh_tokens = await self._cycle_dasd(req_idx, step_idx)
+            else:
+                fresh_tokens = await self._cycle(req_idx, step_idx)
 
             eos_positions = (fresh_tokens == self._tokenizer.eos_token_id).nonzero()
             if eos_positions.numel() > 0:
@@ -122,16 +141,114 @@ class SpecExecClient:
             self._prefix_tokens = torch.cat([self._prefix_tokens, fresh_tokens], dim=-1)
             step_idx += 1
 
-        if eos_flag:
-            self._logger.debug("EOS token found.")
-        else:
-            self._logger.debug("Max new tokens reached.")
-
         self._logger.info("Finished generating sequence req_idx=%d", req_idx)
         self._logger.info(
             "Generated sequence: \n%s",
             self._tokenizer.decode(self._prefix_tokens[0], skip_special_tokens=True),
         )
+
+    # ---------------- Speculative cycles ----------------
+
+    async def _cycle_dasd(self, req_idx: int, step_idx: int) -> torch.Tensor:
+        """
+        DASD (V2) step. If SPECEDGE_T2_SINGLE_CAND=1, run a deterministic local echo T2.
+        """
+        if self._t2_single:
+            # 1) Grow candidates
+            with util.Timing(device=self._device, mode="sync"):
+                _ = self._grow_tree(prefill=False)
+
+            # 2) Pick the newest PROCESSED parent
+            parent_mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
+            parent_mask[: self._tree.prefix_len] = False
+            parent_indices = torch.where(parent_mask)[0]
+
+            if parent_indices.numel() == 0:
+                self._logger.warning("[T2] No parent candidate; returning 0 tokens.")
+                return torch.empty((1, 0), dtype=torch.long, device=self._device)
+
+            p = int(parent_indices[-1].item())  # tree index of parent
+
+            # 3) Build slots from unique parent positions (same policy as V2 adapter)
+            target_token_map_bool = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
+            target_token_map_bool[: self._tree.prefix_len] = False
+
+            # Unique parent absolute positions in order
+            parent_abs = self._tree.parents[: self._tree.end][target_token_map_bool]
+            parent_pos_unique = torch.unique(parent_abs, sorted=True)
+            input_token_map_bool = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+            if parent_pos_unique.numel() > 0:
+                input_token_map_bool[parent_pos_unique] = True
+            # Ensure the chosen parent is present
+            input_token_map_bool[p] = True
+
+            input_indices = torch.where(input_token_map_bool)[0]  # slot order
+            idx_to_slot = {int(t): i for i, t in enumerate(input_indices.view(-1).tolist())}
+            slot = idx_to_slot.get(p, None)
+            if slot is None:
+                raise RuntimeError("T2: chosen parent missing from slots")
+
+            # 4) Selection vector (toggle accept/reject on that one slot)
+            N = int(input_indices.numel())
+            tok = int(self._tree.tokens[p].item())
+            reject_id = 1 if tok != 1 else 2
+            accept = (self._t2_toggle & 1)
+
+            sel = [0] * N
+            sel[slot] = (tok if accept else reject_id)
+            selection = torch.tensor(sel, device=self._device, dtype=torch.long).view(1, -1)
+
+            self._logger.info(
+                "[T2] W=1 parent_idx=%d slot=%d token=%d accept=%d", p, slot, tok, accept
+            )
+
+            # 5) Apply selection like V1, but append the next token via real decode
+            fresh = self._apply_selection_like_v1(
+                selection_1xN=selection,
+                input_token_map_bool=input_token_map_bool,
+                target_token_map_bool=target_token_map_bool,
+            )
+            self._t2_toggle ^= 1
+            return fresh
+
+        # ---------- Real V2 path ----------
+        with util.Timing(device=self._device, mode="sync") as _draft_t:
+            _ = self._grow_tree(prefill=False)
+
+        bundles, start_pos = self._build_dasd_bundles(max_total_len=self._credit)
+
+        with util.Timing(device=self._device, mode="sync") as wait_t:
+            resp = await self._validator.validate_v2(
+                seq_id=f"{self._seq_id}_{req_idx}",
+                bundles=bundles,
+            )
+
+        fresh_token_ids = self._apply_dasd_accept(resp, start_pos)
+
+        # Update AIMD credit
+        self._credit = max(1, int(resp.next_credit))
+        self._max_bundle_len = self._credit
+
+        # Simple stats (optional)
+        self._result_logger.log(
+            {
+                "client_idx": self._client_idx,
+                "req_idx": req_idx,
+                "step_idx": step_idx,
+                "draft": {"forward": [], "end_to_end": 0.0},
+                "target": {
+                    "client_preprocess": 0.0,
+                    "client_wait": wait_t.elapsed,
+                    "client_postprocess": 0.0,
+                    "end_to_end": wait_t.elapsed,
+                    "prefill": 0,
+                    "proactive": False,
+                    "prev_proactive": False,
+                },
+                "num_accepted_tokens": int(fresh_token_ids.size(-1)),
+            }
+        )
+        return fresh_token_ids
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False) -> torch.Tensor:
         with util.Timing(device=self._device, mode="sync") as draft_t:
@@ -161,17 +278,17 @@ class SpecExecClient:
                 "num_accepted_tokens": target_stats["num_accepted_tokens"],
             }
         )
-
         return fresh_token_ids
+
+    # ---------------- Draft growth ----------------
 
     def _grow_tree(self, prefill: bool):
         self._logger.debug("Growing tree")
 
-        # draft forward times
-        draft_forward_times = []
+        draft_forward_times: List[float] = []
 
         max_beam_len = self._max_beam_len
-        if self._proactive_type == "included" and self._proactive_draft:
+        if self._proactive_type == "included" and getattr(self, "_proactive_draft", False):
             max_beam_len = max(0, self._max_beam_len - config.proactive_max_beam_len)
 
         if torch.where(self._tree.status == self._tree.CANDIDATE)[0].numel() == 0:
@@ -184,7 +301,6 @@ class SpecExecClient:
                 self._process_candidates(prefill)
             )
             prefill = False
-
             draft_forward_times.append(draft_forward_t)
 
             (
@@ -238,6 +354,16 @@ class SpecExecClient:
             candidate_indices = candidate_indices[top_k_indices]
             candidate_indices, _ = candidate_indices.sort()
 
+        if candidate_indices.numel() == 0:
+            # No work this round
+            return (
+                torch.empty(0, 0, device=self._device),
+                candidate_indices,
+                torch.empty(0, device=self._device, dtype=torch.long),
+                torch.empty(0, device=self._device),
+                0.0,
+            )
+
         if warmup:
             prefill_input_indices = torch.arange(
                 candidate_indices.min().item(), device=self._device
@@ -258,7 +384,6 @@ class SpecExecClient:
             )
 
         input_indices = candidate_indices
-
         input_ids = self._tree.tokens[input_indices].unsqueeze(0)
         position_ids = self._tree.positions[input_indices].unsqueeze(0)
         cache_seq_indices = input_indices
@@ -291,12 +416,18 @@ class SpecExecClient:
         beam_scores: torch.Tensor,
     ):
         self._logger.debug("Getting next beams")
+        if logits.numel() == 0:
+            return (
+                torch.empty(0, device=self._device, dtype=torch.long),
+                torch.empty(0, device=self._device, dtype=torch.long),
+                torch.empty(0, device=self._device, dtype=torch.long),
+                torch.empty(0, device=self._device),
+            )
+
         DECAY_FACTOR = np.log(0.9)
 
-        logprobs = torch.log_softmax(logits, dim=-1)  # shape: [n_beams, vocab_size]
-        logprobs_k = logprobs.topk(
-            k=self._max_branch_width, dim=-1, sorted=False
-        )  # shape: [n_beams, max_branch_width]
+        logprobs = torch.log_softmax(logits, dim=-1)  # [n_beams, vocab]
+        logprobs_k = logprobs.topk(k=self._max_branch_width, dim=-1, sorted=False)
         leaves_ids = logprobs_k.indices
         leaves_probs = logprobs_k.values
 
@@ -320,19 +451,12 @@ class SpecExecClient:
             min_joint_prob = joint_probs.topk(
                 k=self._max_budget, sorted=False, dim=-1
             ).values.min()
-
             flat_best_mask = torch.where(flat_incoming_probs >= min_joint_prob)[0]
-            flat_best_probs = flat_incoming_probs[flat_best_mask]
             flat_best_indices = flat_best_mask
             best_children_token_ids = flat_incoming_ids[flat_best_indices]
-
-            if flat_best_indices.size(-1) + self._tree.end > self._max_len:
-                raise NotImplementedError("Implement trim budget")
-
         else:
-            flat_best_probs = flat_incoming_probs
             flat_best_indices = torch.arange(
-                flat_incoming_probs.size(0), device=logits.device
+                flat_incoming_probs.size(0), device=logprobs.device
             )
             best_children_token_ids = flat_incoming_ids
 
@@ -344,17 +468,18 @@ class SpecExecClient:
             best_children_token_ids,
             best_children_positions,
             best_beam_indices,
-            flat_best_probs,
+            flat_incoming_probs[flat_best_indices],
         )
 
     def _check_new_token_in_budget(self, cumulative_beam_scores: torch.Tensor):
+        if (self._tree.end - self._tree.prefix_len) == 0:
+            return True
         lowest_tree_logprob = (
             self._tree.logprobs[self._tree.prefix_len : self._tree.end]
             .topk(k=self._max_budget, dim=-1, sorted=False)
             .values.min()
         )
         best_new_logprob = cumulative_beam_scores.max()
-
         return best_new_logprob >= lowest_tree_logprob
 
     def _trim_by_budget(self):
@@ -373,35 +498,150 @@ class SpecExecClient:
         self._tree.gather(src_indices, dest_indices)
         self._engine.gather(src_indices, dest_indices)
 
+    # ---------------- Selection / Validation paths ----------------
+
+    def _append_model_next_token(self) -> torch.Tensor:
+        """
+        Append exactly one next token by running a single forward step at the *true* last prefix.
+        This replaces any 'bonus-token' hacks and keeps the continuation on-manifold.
+        Returns: [1, 1] tensor with the appended token id.
+        """
+        last_idx = self._tree.end - 1
+        input_ids = self._tree.tokens[last_idx:last_idx + 1].unsqueeze(0)           # [1,1]
+        position_ids = self._tree.positions[last_idx:last_idx + 1].unsqueeze(0)     # [1,1]
+        cache_seq_idx = torch.tensor([last_idx], device=self._device)
+        cache_batch_idx = torch.tensor([0], device=self._device)
+        attention_mask = self._tree.amask[..., last_idx:last_idx + 1, :]            # [1,1,1,E]
+
+        logits = self._engine.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cache_batch_indices=cache_batch_idx,
+            cache_seq_indices=cache_seq_idx,
+            attention_mask=attention_mask,
+        )  # [1,1,V]
+        next_id = torch.argmax(logits[0, -1], dim=-1).view(1)                       # [1]
+
+        self._tree.add(
+            token_ids=next_id,
+            token_positions=self._tree.positions[last_idx] + 1,
+            parent_indices=torch.tensor([last_idx], device=self._device),
+            logprobs=torch.tensor([0.0], device=self._device),
+        )
+        self._tree.prefix_len = self._tree.end
+        self._tree.status[: self._tree.prefix_len - 1] = self._tree.PROMPT
+        return next_id.unsqueeze(0)                                                  # [1,1]
+
+    def _apply_selection_like_v1(
+        self,
+        selection_1xN: torch.Tensor,
+        input_token_map_bool: torch.Tensor,
+        target_token_map_bool: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply a V1-style 'selection' vector (size N over slots), compute accepts,
+        reorder KV/tree by best sequence, then append ONE real model-predicted token.
+        """
+        interim_t = torch.ones_like(self._tree.tokens[: self._tree.end])
+        interim_t[input_token_map_bool] = selection_1xN.view(-1)
+
+        draft_token_choices = self._tree.tokens[: self._tree.end][target_token_map_bool]
+        parent_indices = self._tree.parents[: self._tree.end][target_token_map_bool]
+        target_token_choices = interim_t[parent_indices]
+        accept_flags = (draft_token_choices == target_token_choices)
+
+        target_token_indices = torch.where(target_token_map_bool)[0]
+        accept_indices = target_token_indices[accept_flags]
+
+        # Build sequence mask and reorder
+        accept_mask = torch.zeros(self._tree.end, device=self._device)
+        accept_mask[: self._tree.prefix_len] = 1
+        accept_mask[accept_indices] = 1
+
+        # Use amask rows to pick the longest valid sequence
+        accepted_amask = self._tree.amask[0, 0, :, : self._tree.end] * accept_mask
+        mask_row_sums = self._tree.amask[0, 0, :, : self._tree.end].sum(dim=1).to(torch.long)
+        seq_lengths = accepted_amask.sum(dim=1).to(torch.long)
+        best_seq_idx = (mask_row_sums * (mask_row_sums == seq_lengths)).argmax()
+        best_seq_mask = self._tree.amask[0, 0, best_seq_idx, : self._tree.end].to(torch.bool)
+
+        # Fresh = all accepted after prefix
+        fresh_token_indices = torch.where(best_seq_mask[self._tree.prefix_len:])[0] + self._tree.prefix_len
+        fresh_token_ids = self._tree.tokens[fresh_token_indices]
+
+        # Reorder engine/tree
+        self._reorder_by_sequence(best_seq_mask)
+
+        # Append ONE real next token from model
+        next_token = self._append_model_next_token()  # [1,1]
+        if fresh_token_ids.numel() == 0:
+            return next_token  # [1,1]
+        else:
+            return torch.cat([fresh_token_ids.unsqueeze(0), next_token], dim=-1)
+
     async def _validate_tree(self, req_idx: int, prefill=False):
         self._logger.debug("Validating tree")
 
-        with util.Timing(
-            device=self._device, mode=self._target_time_mode
-        ) as preprocess_t:
-            target_token_map_bool = (
-                self._tree.status[: self._tree.end] >= self._tree.PROCESSED
-            )
+        with util.Timing(device=self._device, mode=self._target_time_mode) as preprocess_t:
+            # Candidates = PROCESSED nodes after prefix
+            target_token_map_bool = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
             target_token_map_bool[: self._tree.prefix_len] = False
             target_token_indices = torch.where(target_token_map_bool)[0]
-            target_parent_indices = self._tree.parents[: self._tree.end][
-                target_token_map_bool
-            ]
+            target_parent_indices = self._tree.parents[: self._tree.end][target_token_map_bool]
 
-            input_token_map_bool = target_token_map_bool.clone()
-            input_token_map_bool[target_parent_indices] = True
+            # Build slots: unique parent absolute positions (sorted ascending)
+            parent_pos_unique = torch.unique(target_parent_indices, sorted=True)
+            if parent_pos_unique.numel() == 0:
+                fresh = torch.empty((1, 0), dtype=torch.long, device=self._device)
+                stats = {
+                    "preprocess_t": 0.0,
+                    "wait_t": 0.0,
+                    "postprocess_t": 0.0,
+                    "num_accepted_tokens": 0,
+                    "prefill": 0,
+                    "previous_proactive": False,
+                    "proactive": False,
+                }
+                return fresh, stats
 
-            input_ids = self._tree.tokens[: self._tree.end][
-                input_token_map_bool
-            ].unsqueeze(0)
-            position_ids = self._tree.positions[: self._tree.end][
-                input_token_map_bool
-            ].unsqueeze(0)
+            input_token_map_bool = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+            input_token_map_bool[parent_pos_unique] = True
+
+            input_ids = self._tree.tokens[: self._tree.end][input_token_map_bool].unsqueeze(0)
+            position_ids = self._tree.positions[: self._tree.end][input_token_map_bool].unsqueeze(0)
             cache_seq_indices = torch.where(input_token_map_bool)[0]
             attention_mask = self._tree.amask[..., cache_seq_indices, :]
 
+            # ---- Hard asserts for T2 path correctness ----
+            pos_list = [int(p) for p in position_ids.view(-1).tolist()]
+            assert len(pos_list) == len(set(pos_list)), f"[ASSERT] Duplicate position_ids: {pos_list}"
+
+            pos_to_slot = {p: i for i, p in enumerate(pos_list)}
+            missing = [int(p) for p in target_parent_indices.tolist() if int(p) not in pos_to_slot]
+            assert not missing, f"[ASSERT] Missing parent positions in slots: {missing}"
+
+            # shapes
+            assert position_ids.shape == input_ids.shape, \
+                f"[ASSERT] position_ids shape {position_ids.shape} != input_ids shape {input_ids.shape}"
+
+        # Echo test short-circuit (no mutation)
+        if os.getenv("SPECEDGE_ECHO_TEST", "0") == "1":
+            self._logger.info("SPECEDGE_ECHO_TEST enabled: returning 0-accepts, no mutation.")
+            fresh = torch.empty((1, 0), dtype=torch.long, device=self._device)
+            stats = {
+                "preprocess_t": 0.0,
+                "wait_t": 0.0,
+                "postprocess_t": 0.0,
+                "num_accepted_tokens": 0,
+                "prefill": 0,
+                "previous_proactive": getattr(self, "_previous_proactive_draft", False),
+                "proactive": False,
+            }
+            return fresh, stats
+
         with util.Timing(device=self._device, mode=self._target_time_mode) as wait_t:
             prefix = self._prompt if prefill else None
+            draft_token_choices = self._tree.tokens[: self._tree.end][target_token_map_bool]
             target_result = asyncio.create_task(
                 self._validator.request(
                     client_idx=self._client_idx,
@@ -413,6 +653,7 @@ class SpecExecClient:
                     parent_indices=target_parent_indices,
                     prefill=prefill,
                     prefix=prefix,
+                    token_ids=draft_token_choices,  # V2 adapter needs this
                 )
             )
             await asyncio.sleep(0.00001)
@@ -429,119 +670,35 @@ class SpecExecClient:
                 target_result.result() if target_result.done() else await target_result
             )
 
-        with util.Timing(
-            device=self._device, mode=self._target_time_mode
-        ) as postprocess_t:
-            interim_t = torch.ones_like(self._tree.tokens[: self._tree.end])
-            interim_t[input_token_map_bool] = selection
-
-            draft_token_choices = self._tree.tokens[: self._tree.end][
-                target_token_map_bool
-            ]
-            target_token_choices = interim_t[target_parent_indices]
-
-            accept_flags = draft_token_choices == target_token_choices
-
-            accept_indices = target_token_indices[accept_flags]
-
-            accept_mask = torch.zeros(self._tree.end, device=self._device)
-            accept_mask[: self._tree.prefix_len] = 1
-            accept_mask[accept_indices] = 1
-            accepted_amask = attention_mask[0, 0, :, : self._tree.end] * accept_mask
-
-            mask_row_sums = (
-                attention_mask[0, 0, :, : self._tree.end].sum(dim=1).to(torch.long)
+        with util.Timing(device=self._device, mode=self._target_time_mode) as postprocess_t:
+            fresh = self._apply_selection_like_v1(
+                selection_1xN=selection,
+                input_token_map_bool=input_token_map_bool,
+                target_token_map_bool=target_token_map_bool,
             )
-
-            seq_lengths = accepted_amask.sum(dim=1).to(torch.long)
-            best_seq_idx = (mask_row_sums * (mask_row_sums == seq_lengths)).argmax()
-            best_seq_mask = attention_mask[0, 0, best_seq_idx, : self._tree.end].to(
-                torch.bool
-            )
-
-            fresh_token_indices = (
-                torch.where(best_seq_mask[self._tree.prefix_len :])[0]
-                + self._tree.prefix_len
-            )
-            fresh_token_ids = self._tree.tokens[fresh_token_indices]
-
-            last_accepted_token_idx = (
-                fresh_token_indices[-1]
-                if fresh_token_indices.numel() > 0
-                else torch.tensor([self._tree.prefix_len - 1])
-            ).to(self._device)
-
-            # add one bonus token to num of accepted tokens
-            self._logger.debug(
-                "Num of accepted tokens: %d", fresh_token_indices.numel() + 1
-            )
-
-            extra_token_id = torch.tensor(
-                [interim_t[last_accepted_token_idx]], device=self._device
-            )
-
-            if self._proactive_client is not None:
-                self._previous_proactive_draft = self._proactive_draft
-
-            if (
-                self._proactive_client is not None
-                and root_leaf_idx is not None  # type: ignore
-                and root_leaf_idx == last_accepted_token_idx  # type: ignore
-                and extra_token_id == root_token_id  # type: ignore
-            ):
-                self._proactive_draft = True
-                self._reorder_by_sequence_proactive(
-                    best_seq_mask,
-                    proactive_tree_prefix_len,  # type: ignore
-                    proactive_tree_end,  # type: ignore
-                )
-            else:
-                self._proactive_draft = False
-                self._reorder_by_sequence(best_seq_mask)
-                self._tree.add(
-                    token_ids=extra_token_id,
-                    token_positions=self._tree.positions[self._tree.end - 1] + 1,
-                    parent_indices=torch.tensor(
-                        [self._tree.end - 1], device=self._device
-                    ),
-                    logprobs=torch.tensor([0.0], device=self._device),
-                )
-                self._tree.prefix_len = self._tree.end
-                self._tree.status[: self._tree.prefix_len - 1] = self._tree.PROMPT
-
-            fresh_token_ids = torch.cat(
-                [fresh_token_ids, extra_token_id], dim=-1
-            ).unsqueeze(0)
 
         stats = {
             "preprocess_t": preprocess_t.elapsed,
             "wait_t": wait_t.elapsed,
             "postprocess_t": postprocess_t.elapsed,
-            "num_accepted_tokens": fresh_token_ids.size(-1),
+            "num_accepted_tokens": fresh.size(-1),
             "prefill": prefill_cnt,
-            "previous_proactive": self._previous_proactive_draft
+            "previous_proactive": getattr(self, "_previous_proactive_draft", False)
             if self._proactive_client
             else False,
-            "proactive": self._proactive_draft if self._proactive_client else False,
+            "proactive": getattr(self, "_proactive_draft", False) if self._proactive_client else False,
         }
+        return fresh, stats
 
-        return fresh_token_ids, stats
+    # ---------------- Reorder helpers ----------------
 
     def _reorder_by_sequence(self, seq_mask: torch.Tensor):
-        """
-        Reorder the tree and engine's kv cache according to the validated sequence.
-
-        Args:
-            seq_mask: Sequence Mask
-        """
-
+        """Reorder tree and engine's kv cache according to seq_mask."""
         seq_indices = torch.where(seq_mask != 0)[0]
-
         self._engine.gather(
             seq_indices,
             torch.arange(seq_indices.size(-1), device=self._device),
         )
-
         self._tree.reorder_by_sequence(seq_mask, seq_indices)
 
     def _reorder_by_sequence_proactive(
@@ -551,21 +708,13 @@ class SpecExecClient:
         proactive_tree_end: int,
     ):
         """
-        Reorders the tree and engine's kv cache in a valid sequence
-        when the tree generated by Proactive Draft is valid.
-
-        Args:
-            seq_mask: Sequence Mask
-            proactive_tree_prefix_len: Start of the tree generated by Proactive Draft
-            proactive_tree_end: End of the tree generated by Proactive Draft
+        (Kept intact) Reorders KV when Proactive Draft is valid.
         """
         seq_indices = torch.where(seq_mask != 0)[0]
         max_src_idx = proactive_tree_end
         mapping_tensor = torch.full(
             (max_src_idx,), -1, dtype=torch.long, device=self._device
         )
-
-        # Original Draft Tree
 
         new_prefix_len = int(torch.sum(seq_mask).item())
         if torch.any(seq_mask[self._tree.prefix_len :]):
@@ -579,8 +728,6 @@ class SpecExecClient:
             self._tree.positions[dest_indices] = dest_indices
             self._tree.parents[dest_indices] = dest_indices - 1
             self._tree.status[dest_indices] = self._tree.GENERATED
-
-        # Proactive Tree
 
         src_indices = torch.arange(
             proactive_tree_prefix_len, proactive_tree_end, device=self._device
@@ -624,7 +771,6 @@ class SpecExecClient:
         )
 
         self._tree.logprobs[self._tree.end :].zero_()
-        # FIXME: change to public property access
         self._tree._data[:, self._tree.end :].zero_()
 
         _causal_mask = torch.tril(
@@ -635,15 +781,104 @@ class SpecExecClient:
                 device=self._device,
             )
         )
-        self._tree.amask[..., : self._tree.prefix_len, : self._tree.prefix_len] = (
-            _causal_mask
-        )
-        self._tree.amask[
-            ..., self._tree.prefix_len : self._tree.end, : self._tree.prefix_len
-        ] = 1.0
+        self._tree.amask[..., : self._tree.prefix_len, : self._tree.prefix_len] = _causal_mask
+        self._tree.amask[..., self._tree.prefix_len : self._tree.end, : self._tree.prefix_len] = 1.0
 
         src_indices = seq_mask[: self._tree.prefix_len]
         src_indices = torch.where(src_indices)[0]
         dst_indices = torch.arange(src_indices.size(-1), device=self._device)
-
         self._engine.gather(src_indices, dst_indices)
+
+    # ---------------- DASD bundle path ----------------
+
+    def _build_dasd_bundles(self, max_total_len: int) -> Tuple[list, int]:
+        """
+        Pick up to 'max_total_len' candidate tokens after prefix, left-to-right by position.
+        """
+        mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
+        mask[: self._tree.prefix_len] = False
+        cand_idx = torch.where(mask)[0]
+
+        if cand_idx.numel() == 0:
+            start_pos = int(self._tree.positions[self._tree.end - 1].item())
+            bundle = specedge_pb2.Bundle(
+                seq_id="",
+                bundle_id=self._bundle_id + 1,
+                start_pos=start_pos,
+                len=0,
+                token_ids=[],
+                qlogp_i8=b"",
+                credit_left=self._credit,
+                flags=0,
+            )
+            return [bundle], start_pos
+
+        pos = self._tree.positions[cand_idx]
+        order = torch.argsort(pos)
+        ordered = cand_idx[order]
+
+        take = min(max_total_len, ordered.numel())
+        seg = ordered[:take]
+        tok_ids = self._tree.tokens[seg].tolist()
+        start_pos = int(self._tree.positions[seg[0]].item() - 1)  # parent abs pos
+
+        qlogp = torch.zeros(take, dtype=torch.int8, device=self._device)
+
+        self._bundle_id += 1
+        bundle = specedge_pb2.Bundle(
+            seq_id="",
+            bundle_id=self._bundle_id,
+            start_pos=start_pos,
+            len=take,
+            token_ids=tok_ids,
+            qlogp_i8=util.encode(qlogp),
+            credit_left=max_total_len - take,
+            flags=0,
+        )
+        return [bundle], start_pos
+
+    def _apply_dasd_accept(self, resp: "specedge_pb2.ValidateResponseV2", start_pos: int) -> torch.Tensor:
+        """
+        Convert accept bitmap to indices, reorder, then append one *real* next token.
+        """
+        bm = resp.accept_bitmap  # bytes
+        if not bm:
+            # Nothing accepted: no reorder, just append next token via model
+            return self._append_model_next_token()
+
+        # Unpack bitmap (LSB-first) and trim to L = last_accepted_pos - start_pos
+        bits: List[int] = []
+        for b in bm:
+            for k in range(8):
+                bits.append((b >> k) & 1)
+        L = max(0, resp.last_accepted_pos - start_pos)
+        bits = bits[:L]
+        if L == 0:
+            return self._append_model_next_token()
+        bits_t = torch.tensor(bits, device=self._device, dtype=torch.bool)
+
+        # Rebuild the current segment used to form the bundle (left-to-right)
+        mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
+        mask[: self._tree.prefix_len] = False
+        cand_idx = torch.where(mask)[0]
+        pos = self._tree.positions[cand_idx]
+        order = torch.argsort(pos)
+        ordered = cand_idx[order]
+        seg = ordered[:L]
+        accepted = seg[bits_t]
+
+        # Sequence mask with accepted tokens
+        seq_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        seq_mask[: self._tree.prefix_len] = True
+        seq_mask[accepted] = True
+
+        # Reorder and extract fresh
+        self._reorder_by_sequence(seq_mask)
+        fresh_token_ids = self._tree.tokens[self._tree.prefix_len : self._tree.end]
+
+        # Append one real next token
+        next_token = self._append_model_next_token()
+        if fresh_token_ids.numel() == 0:
+            return next_token
+        else:
+            return torch.cat([fresh_token_ids.unsqueeze(0), next_token], dim=-1)

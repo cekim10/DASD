@@ -1,6 +1,7 @@
 import argparse
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import yaml
@@ -8,6 +9,14 @@ import yaml
 import log
 
 SPECEDGE_ROOT = Path(__file__).absolute().parents[2]
+
+
+def _as_bool(x, default=False):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        return x.lower() in ("1", "true", "yes", "on")
+    return default
 
 
 def main(config_file: str):
@@ -72,6 +81,20 @@ def main(config_file: str):
     max_new_tokens = config["client"]["max_new_tokens"]
     max_request_num = config["client"]["max_request_num"]
 
+    # DASD enable/knobs
+    # Source of truth is server.dasd.enable, but allow client override at client.dasd.enable
+    server_dasd = config.get("server", {}).get("dasd", {})
+    dasd_enable = _as_bool((server_dasd.get("enable", False)))
+    client_dasd_override = config["client"]["dasd"].get("enable", None)
+    if client_dasd_override:
+        dasd_enable = _as_bool(client_dasd_override, dasd_enable)
+
+    dasd_tick_ms = server_dasd.get("tick_ms", 4)
+    dasd_aimd = server_dasd.get("aimd", {})
+    dasd_pas = server_dasd.get("pas", {})
+
+    logger.info("DASD (client view): enable=%s tick_ms=%s", dasd_enable, dasd_tick_ms)
+
     # node configuration
     nodes = config["node"]
     logger.debug("nodes: %s", nodes)
@@ -111,8 +134,24 @@ def main(config_file: str):
                 "SPECEDGE_HOST": host,
                 "SPECEDGE_CLIENT_IDX": client_idx,
                 "SPECEDGE_REASONING": reasoning,
+                "SPECEDGE_T2_SINGLE_CAND": os.getenv("SPECEDGE_T2_SINGLE_CAND"),
+                # DASD switch
+                "DASD_ENABLE": "1" if dasd_enable else "0",
+
+                # (optional) forward knobs for client-side logs/metrics
+                "DASD_TICK_MS": str(dasd_tick_ms),
+                "DASD_AIMD_R_TARGET": str(dasd_aimd.get("r_target", 0.85)),
+                "DASD_AIMD_INC": str(dasd_aimd.get("inc", 2)),
+                "DASD_AIMD_DEC_FACTOR": str(dasd_aimd.get("dec_factor", 0.5)),
+                "DASD_AIMD_MIN_CREDIT": str(dasd_aimd.get("min_credit", 4)),
+                "DASD_AIMD_MAX_CREDIT": str(dasd_aimd.get("max_credit", 64)),
+                "DASD_PAS_ENABLE": "1" if _as_bool(dasd_pas.get("enable", False)) else "0",
+                "DASD_PAS_TOP_M": str(dasd_pas.get("top_m", 8)),
+                "DASD_PAS_BROADCAST_EVERY": str(dasd_pas.get("broadcast_every", 2)),
+                "DASD_PAS_TTL": str(dasd_pas.get("ttl", 64)),
             }
 
+            # Build one remote command that exports env then runs the client
             cmd = f"cd {SPECEDGE_ROOT} && "
 
             for key, value in env_vars.items():
