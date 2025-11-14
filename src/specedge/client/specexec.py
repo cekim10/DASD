@@ -151,7 +151,7 @@ class SpecExecClient:
 
     async def _cycle_dasd(self, req_idx: int, step_idx: int) -> torch.Tensor:
         """One DASD (V2) step: grow draft tree, send bundles to ValidateV2, apply bitmap."""
-        self._logger.info("DASD/V2 cycle: req_idx=%d, step_idx=%d", req_idx, step_idx)
+        self._logger.debug("DASD/V2 cycle: req_idx=%d, step_idx=%d", req_idx, step_idx)
 
         # 1) Draft: grow the speculative tree as in V1
         with util.Timing(device=self._device, mode="sync") as draft_t:
@@ -787,10 +787,18 @@ class SpecExecClient:
             empty_path = torch.empty(0, dtype=torch.long, device=self._device)
             return [bundle], start_pos, empty_path
 
-        # Pick the best leaf among current candidates.
-        cand_logprobs = self._tree.logprobs[cand_idx]
-        best_leaf_rel = torch.argmax(cand_logprobs)
+        # Pick the deepest leaf among current candidates: maximize position (depth),
+        # instead of the single highest cumulative logprob which tends to bias to depth-1.
+        cand_positions = self._tree.positions[cand_idx]
+        best_leaf_rel = torch.argmax(cand_positions)
         best_leaf = cand_idx[best_leaf_rel].item()
+
+        self._logger.info(
+            "[DASD DEBUG] build_bundles: prefix_len=%d cand=%d best_leaf_pos=%d",
+            int(self._tree.prefix_len),
+            int(cand_idx.numel()),
+            int(cand_positions[best_leaf_rel].item()),
+        )
 
         # Walk back from best_leaf to the current prefix to form a chain.
         path_indices: List[int] = []
@@ -820,13 +828,28 @@ class SpecExecClient:
         path_indices.reverse()
         path_t = torch.tensor(path_indices, dtype=torch.long, device=self._device)
 
+        # Cap by current credit / max_total_len so W <= credit
+        if path_t.numel() > max_total_len:
+            path_t = path_t[:max_total_len]
+
         tok_ids = self._tree.tokens[path_t].tolist()
         take = len(tok_ids)
         # The parent absolute position is one before the first token in the chain.
         start_pos = int(self._tree.positions[path_t[0]].item() - 1)
 
-        # (Optional) pack per-token qlogp as int8; for now we send zeros.
-        qlogp = torch.zeros(take, dtype=torch.int8, device=self._device)
+        # Compute per-token incremental logprobs along this path.
+        path_logprobs = self._tree.logprobs[path_t]
+        parent_indices = self._tree.parents[path_t]
+        parent_logprobs = torch.zeros_like(path_logprobs)
+        valid_parent_mask = parent_indices >= 0
+        parent_logprobs[valid_parent_mask] = self._tree.logprobs[parent_indices[valid_parent_mask]]
+        deltas = path_logprobs - parent_logprobs
+
+        # Quantize deltas to int8 for DASD verification.
+        q_scale = float(os.getenv("DASD_QLOGP_I8_SCALE", "8.0"))
+        qlogp_f = torch.clamp((deltas * q_scale).round(), -128, 127)
+        qlogp = qlogp_f.to(torch.int8)
+        qlogp_bytes = qlogp.detach().cpu().numpy().tobytes()
 
         self._bundle_id += 1
         bundle = specedge_pb2.Bundle(
@@ -835,7 +858,7 @@ class SpecExecClient:
             start_pos=start_pos,
             len=take,
             token_ids=tok_ids,
-            qlogp_i8=util.encode(qlogp),
+            qlogp_i8=qlogp_bytes,
             credit_left=max_total_len - take,
             flags=0,
         )
@@ -860,8 +883,6 @@ class SpecExecClient:
         for b in resp.accept_bitmap:
             for k in range(8):
                 bits.append((b >> k) & 1)
-
-        self._logger.info(f"accept_bitmap: {bits}")
         L = min(len(bits), path_indices.numel())
         bits = bits[:L]
         if L == 0:

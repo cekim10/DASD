@@ -7,6 +7,7 @@ import grpc.aio
 import log
 from specedge_grpc import specedge_pb2
 from specedge_grpc import specedge_pb2_grpc
+import numpy as np
 
 
 def _as_bool(x, default=False):
@@ -62,6 +63,11 @@ def _pack_bitmap_from_bits(bits: list[int]) -> bytes:
         out.append(byte)
     return bytes(out)
 
+def _decode_qlogp_i8(data: bytes) -> list[int]:
+    if not data:
+        return []
+    arr = np.frombuffer(data, dtype=np.int8)
+    return arr.tolist()
 
 
 class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
@@ -96,6 +102,9 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         self._pas_broadcast_every = _get_env_int("DASD_PAS_BROADCAST_EVERY", 2)
         self._pas_ttl = _get_env_int("DASD_PAS_TTL", 64)
 
+        self._qlogp_i8_thresh = _get_env_int("DASD_QLOGP_I8_THRESH", -8)
+        self._qlogp_i8_min_run = _get_env_int("DASD_QLOGP_I8_MIN_RUN", 1)
+
         # Per-sequence tracking
         # last accepted absolute position
         self._last_pos: dict[str, int] = defaultdict(int)
@@ -104,7 +113,7 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
 
         self._logger.info(
             "DASD V2 server init: enable=%s tick_ms=%s aimd(r*=%.2f, +%d, x%.2f, min=%d, max=%d) "
-            "pas(enable=%s, top_m=%d, every=%d, ttl=%d)",
+            "pas(enable=%s, top_m=%d, every=%d, ttl=%d) qlogp(thresh=%d,min_run=%d)",
             self._dasd_enable,
             self._tick_ms,
             self._aimd_r_target,
@@ -116,6 +125,8 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
             self._pas_top_m,
             self._pas_broadcast_every,
             self._pas_ttl,
+            self._qlogp_i8_thresh,
+            self._qlogp_i8_min_run,
         )
 
     async def ValidateV2(
@@ -146,21 +157,37 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
             accept_bitmap = _pack_all_ones_bitmap(W)
             r_obs = 1.0 if W > 0 else 0.0
         else:
-            # Simple placeholder policy for DASD:
-            #  * accept roughly r* of the W tokens, always from the front
-            #  * this guarantees that for W >= 2 we will often see multiple 1s
-            #    in the bitmap so you can visually confirm V2 is doing partial
-            #    acceptance.
+            # DASD qlogp-based verifier:
+            # If qlogp_i8 is present, we accept tokens from the front while
+            # their score is above a threshold. Once a token falls below the
+            # threshold, we stop accepting the rest of the window.
             accept_bits = [0] * W
-            if W > 0:
-                max_accept = max(1, int(W * self._aimd_r_target))
-                # Clamp max_accept to W so we never go out of bounds.
-                max_accept = min(max_accept, W)
-                for i in range(max_accept):
-                    accept_bits[i] = 1
-            r_obs = (sum(accept_bits) / W) if W > 0 else 0.0
+            if W > 0 and b.qlogp_i8:
+                scores = _decode_qlogp_i8(b.qlogp_i8)
+                if len(scores) < W:
+                    scores = scores + [scores[-1]] * (W - len(scores))
+                scores = scores[:W]
+                accepted = 0
+                for i in range(W):
+                    if scores[i] >= self._qlogp_i8_thresh:
+                        accept_bits[i] = 1
+                        accepted += 1
+                    else:
+                        break
+                # Optionally enforce a minimum run length of accepts when we
+                # start accepting; if accepted is non-zero but less than
+                # _qlogp_i8_min_run, discard them.
+                if 0 < accepted < self._qlogp_i8_min_run:
+                    for i in range(accepted):
+                        accept_bits[i] = 0
+                    accepted = 0
+                r_obs = (accepted / W) if W > 0 else 0.0
+            else:
+                # Fallback: if we don't have qlogp_i8, accept everything.
+                accept_bits = [1] * W
+                r_obs = 1.0 if W > 0 else 0.0
+
             accept_bitmap = _pack_bitmap_from_bits(accept_bits)
-            # Debug: log what the server decided for this bundle.
             self._logger.info(
                 "[DASD] V2 server decision seq=%s bundle_id=%d start=%d W=%d accepted=%d r_obs=%.3f bits=%s",
                 seq_id,
@@ -172,11 +199,13 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
                 accept_bits,
             )
 
-        # Move the last validated position forward (this is the end of the evaluated window),
-        # not necessarily the last *accepted* position.
-        new_pos = int(b.start_pos) + W
-        if new_pos > self._last_pos[seq_id]:
-            self._last_pos[seq_id] = new_pos
+        # last_accepted_pos moves to the end of the accepted prefix within this window.
+        # Tokens in the window cover positions (start_pos+1) .. (start_pos+W).
+        accepted_count = sum(accept_bits)
+        if accepted_count > 0:
+            new_pos = int(b.start_pos) + accepted_count
+            if new_pos > self._last_pos[seq_id]:
+                self._last_pos[seq_id] = new_pos
 
         # AIMD based on observed acceptance rate r_obs.
         c = self._credit[seq_id]
