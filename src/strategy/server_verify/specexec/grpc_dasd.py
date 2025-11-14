@@ -38,6 +38,30 @@ def _pack_all_ones_bitmap(length: int) -> bytes:
         out.append((1 << rem) - 1)
     return bytes(out)
 
+def _pack_bitmap_from_bits(bits: list[int]) -> bytes:
+    """Pack a list of 0/1 ints into bytes, LSB-first per byte (same layout as _pack_all_ones_bitmap)."""
+    length = len(bits)
+    if length <= 0:
+        return b""
+    full, rem = divmod(length, 8)
+    out = bytearray()
+    idx = 0
+    for _ in range(full):
+        byte = 0
+        for k in range(8):
+            if bits[idx]:
+                byte |= (1 << k)
+            idx += 1
+        out.append(byte)
+    if rem:
+        byte = 0
+        for k in range(rem):
+            if bits[idx]:
+                byte |= (1 << k)
+            idx += 1
+        out.append(byte)
+    return bytes(out)
+
 
 
 class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
@@ -117,16 +141,44 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
         W = int(b.len)
         ack_id = int(b.bundle_id)
 
-        # dummy policy: accept all W tokens
-        accept_bitmap = _pack_all_ones_bitmap(W)
+        # When DASD is disabled, keep the simple "accept all" behavior for safety.
+        if not self._dasd_enable:
+            accept_bitmap = _pack_all_ones_bitmap(W)
+            r_obs = 1.0 if W > 0 else 0.0
+        else:
+            # Simple placeholder policy for DASD:
+            #  * accept roughly r* of the W tokens, always from the front
+            #  * this guarantees that for W >= 2 we will often see multiple 1s
+            #    in the bitmap so you can visually confirm V2 is doing partial
+            #    acceptance.
+            accept_bits = [0] * W
+            if W > 0:
+                max_accept = max(1, int(W * self._aimd_r_target))
+                # Clamp max_accept to W so we never go out of bounds.
+                max_accept = min(max_accept, W)
+                for i in range(max_accept):
+                    accept_bits[i] = 1
+            r_obs = (sum(accept_bits) / W) if W > 0 else 0.0
+            accept_bitmap = _pack_bitmap_from_bits(accept_bits)
+            # Debug: log what the server decided for this bundle.
+            self._logger.info(
+                "[DASD] V2 server decision seq=%s bundle_id=%d start=%d W=%d accepted=%d r_obs=%.3f bits=%s",
+                seq_id,
+                ack_id,
+                int(b.start_pos),
+                W,
+                sum(accept_bits),
+                r_obs,
+                accept_bits,
+            )
 
-        # Move the last accepted position forward
+        # Move the last validated position forward (this is the end of the evaluated window),
+        # not necessarily the last *accepted* position.
         new_pos = int(b.start_pos) + W
         if new_pos > self._last_pos[seq_id]:
             self._last_pos[seq_id] = new_pos
 
-        # Toy AIMD: pretend perfect acceptance r=1.0
-        r_obs = 1.0
+        # AIMD based on observed acceptance rate r_obs.
         c = self._credit[seq_id]
         if r_obs >= self._aimd_r_target:
             c = min(self._aimd_max_credit, c + self._aimd_inc)
@@ -141,7 +193,7 @@ class SpecExecDasdServer(specedge_pb2_grpc.SpecEdgeServiceServicer):
             last_accepted_pos=self._last_pos[seq_id],
             accept_bitmap=accept_bitmap,
             next_credit=c,
-            hint_mask=b"" # PAS off for now
+            hint_mask=b""  # PAS off for now
         )
 
     async def cleanup(self):

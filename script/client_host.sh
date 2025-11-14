@@ -46,6 +46,6 @@ while getopts "f:rh" opt; do
 done
 shift $((OPTIND-1))
 
-export SPECEDGE_T2_SINGLE_CAND=1
+export SPECEDGE_T2_SINGLE_CAND=0
 # run the application
 python src/script/client_host.py --config "$config_file"

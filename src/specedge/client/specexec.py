@@ -150,104 +150,70 @@ class SpecExecClient:
     # ---------------- Speculative cycles ----------------
 
     async def _cycle_dasd(self, req_idx: int, step_idx: int) -> torch.Tensor:
-        """
-        DASD (V2) step. If SPECEDGE_T2_SINGLE_CAND=1, run a deterministic local echo T2.
-        """
-        if self._t2_single:
-            # 1) Grow candidates
-            with util.Timing(device=self._device, mode="sync"):
-                _ = self._grow_tree(prefill=False)
+        """One DASD (V2) step: grow draft tree, send bundles to ValidateV2, apply bitmap."""
+        self._logger.info("DASD/V2 cycle: req_idx=%d, step_idx=%d", req_idx, step_idx)
 
-            # 2) Pick the newest PROCESSED parent
-            parent_mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
-            parent_mask[: self._tree.prefix_len] = False
-            parent_indices = torch.where(parent_mask)[0]
+        # 1) Draft: grow the speculative tree as in V1
+        with util.Timing(device=self._device, mode="sync") as draft_t:
+            draft_stats = self._grow_tree(prefill=False)
 
-            if parent_indices.numel() == 0:
-                self._logger.warning("[T2] No parent candidate; returning 0 tokens.")
-                return torch.empty((1, 0), dtype=torch.long, device=self._device)
+        # 2) Build DASD bundles up to current credit (and remember the path)
+        bundles, start_pos, path_indices = self._build_dasd_bundles(
+            max_total_len=self._credit
+        )
 
-            p = int(parent_indices[-1].item())  # tree index of parent
-
-            # 3) Build slots from unique parent positions (same policy as V2 adapter)
-            target_token_map_bool = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
-            target_token_map_bool[: self._tree.prefix_len] = False
-
-            # Unique parent absolute positions in order
-            parent_abs = self._tree.parents[: self._tree.end][target_token_map_bool]
-            parent_pos_unique = torch.unique(parent_abs, sorted=True)
-            input_token_map_bool = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
-            if parent_pos_unique.numel() > 0:
-                input_token_map_bool[parent_pos_unique] = True
-            # Ensure the chosen parent is present
-            input_token_map_bool[p] = True
-
-            input_indices = torch.where(input_token_map_bool)[0]  # slot order
-            idx_to_slot = {int(t): i for i, t in enumerate(input_indices.view(-1).tolist())}
-            slot = idx_to_slot.get(p, None)
-            if slot is None:
-                raise RuntimeError("T2: chosen parent missing from slots")
-
-            # 4) Selection vector (toggle accept/reject on that one slot)
-            N = int(input_indices.numel())
-            tok = int(self._tree.tokens[p].item())
-            reject_id = 1 if tok != 1 else 2
-            accept = (self._t2_toggle & 1)
-
-            sel = [0] * N
-            sel[slot] = (tok if accept else reject_id)
-            selection = torch.tensor(sel, device=self._device, dtype=torch.long).view(1, -1)
-
-            self._logger.info(
-                "[T2] W=1 parent_idx=%d slot=%d token=%d accept=%d", p, slot, tok, accept
-            )
-
-            # 5) Apply selection like V1, but append the next token via real decode
-            fresh = self._apply_selection_like_v1(
-                selection_1xN=selection,
-                input_token_map_bool=input_token_map_bool,
-                target_token_map_bool=target_token_map_bool,
-            )
-            self._t2_toggle ^= 1
-            return fresh
-
-        # ---------- Real V2 path ----------
-        with util.Timing(device=self._device, mode="sync") as _draft_t:
-            _ = self._grow_tree(prefill=False)
-
-        bundles, start_pos = self._build_dasd_bundles(max_total_len=self._credit)
-
+        # 3) Call ValidateV2 on the server
         with util.Timing(device=self._device, mode="sync") as wait_t:
             resp = await self._validator.validate_v2(
                 seq_id=f"{self._seq_id}_{req_idx}",
                 bundles=bundles,
             )
 
-        fresh_token_ids = self._apply_dasd_accept(resp, start_pos)
+        # 4) Apply accept bitmap along that path and update local tree / KV cache
+        with util.Timing(device=self._device, mode="sync") as post_t:
+            fresh_token_ids = self._apply_dasd_accept(resp, start_pos, path_indices)
 
-        # Update AIMD credit
-        self._credit = max(1, int(resp.next_credit))
+        # 5) Update credit from server AIMD
+        try:
+            self._credit = max(1, int(resp.next_credit))
+        except Exception:
+            # Be robust if server does not set next_credit
+            self._credit = max(1, self._credit)
         self._max_bundle_len = self._credit
 
-        # Simple stats (optional)
+        # 6) Log stats in the same schema as _cycle
+        target_stats = {
+            "preprocess_t": 0.0,                  # bundle building is cheap, folded into draft_t/post_t
+            "wait_t": wait_t.elapsed,
+            "postprocess_t": post_t.elapsed,
+            "num_accepted_tokens": int(fresh_token_ids.size(-1)),
+            "prefill": 0,
+            "proactive": False,
+            "previous_proactive": False,
+        }
+
         self._result_logger.log(
             {
                 "client_idx": self._client_idx,
                 "req_idx": req_idx,
                 "step_idx": step_idx,
-                "draft": {"forward": [], "end_to_end": 0.0},
-                "target": {
-                    "client_preprocess": 0.0,
-                    "client_wait": wait_t.elapsed,
-                    "client_postprocess": 0.0,
-                    "end_to_end": wait_t.elapsed,
-                    "prefill": 0,
-                    "proactive": False,
-                    "prev_proactive": False,
+                "draft": {
+                    "forward": draft_stats["forward_t"],
+                    "end_to_end": draft_t.elapsed,
                 },
-                "num_accepted_tokens": int(fresh_token_ids.size(-1)),
+                "target": {
+                    "client_preprocess": target_stats["preprocess_t"],
+                    "client_wait": target_stats["wait_t"],
+                    "client_postprocess": target_stats["postprocess_t"],
+                    "end_to_end": wait_t.elapsed + post_t.elapsed,
+                    "prefill": target_stats["prefill"],
+                    "proactive": target_stats["proactive"],
+                    "prev_proactive": target_stats["previous_proactive"],
+                },
+                "num_accepted_tokens": target_stats["num_accepted_tokens"],
             }
         )
+
         return fresh_token_ids
 
     async def _cycle(self, req_idx: int, step_idx: int, prefill=False) -> torch.Tensor:
@@ -791,15 +757,22 @@ class SpecExecClient:
 
     # ---------------- DASD bundle path ----------------
 
-    def _build_dasd_bundles(self, max_total_len: int) -> Tuple[list, int]:
+    def _build_dasd_bundles(self, max_total_len: int) -> Tuple[list, int, torch.Tensor]:
+        """Pick up to `max_total_len` candidate tokens along a *single* linear path.
+
+        We choose the best leaf (highest cumulative logprob among PROCESSED nodes
+        after the prefix), then walk its ancestors back to the prefix to form a
+        straight chain. This matches the ValidateV2 semantics of scanning a
+        single linear draft segment.
         """
-        Pick up to 'max_total_len' candidate tokens after prefix, left-to-right by position.
-        """
+        # Candidates that have been drafted and processed, but are not yet in prefix
         mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
         mask[: self._tree.prefix_len] = False
         cand_idx = torch.where(mask)[0]
 
         if cand_idx.numel() == 0:
+            # No drafted tokens this round: send an empty bundle so server can
+            # still update credit, and let the client advance with base model.
             start_pos = int(self._tree.positions[self._tree.end - 1].item())
             bundle = specedge_pb2.Bundle(
                 seq_id="",
@@ -811,17 +784,48 @@ class SpecExecClient:
                 credit_left=self._credit,
                 flags=0,
             )
-            return [bundle], start_pos
+            empty_path = torch.empty(0, dtype=torch.long, device=self._device)
+            return [bundle], start_pos, empty_path
 
-        pos = self._tree.positions[cand_idx]
-        order = torch.argsort(pos)
-        ordered = cand_idx[order]
+        # Pick the best leaf among current candidates.
+        cand_logprobs = self._tree.logprobs[cand_idx]
+        best_leaf_rel = torch.argmax(cand_logprobs)
+        best_leaf = cand_idx[best_leaf_rel].item()
 
-        take = min(max_total_len, ordered.numel())
-        seg = ordered[:take]
-        tok_ids = self._tree.tokens[seg].tolist()
-        start_pos = int(self._tree.positions[seg[0]].item() - 1)  # parent abs pos
+        # Walk back from best_leaf to the current prefix to form a chain.
+        path_indices: List[int] = []
+        cur = best_leaf
+        # We stop once we reach a position that is already in the committed prefix.
+        while cur >= self._tree.prefix_len and len(path_indices) < max_total_len:
+            path_indices.append(cur)
+            cur = int(self._tree.parents[cur].item())
 
+        if not path_indices:
+            # Should not generally happen, but be defensive.
+            start_pos = int(self._tree.positions[self._tree.end - 1].item())
+            bundle = specedge_pb2.Bundle(
+                seq_id="",
+                bundle_id=self._bundle_id + 1,
+                start_pos=start_pos,
+                len=0,
+                token_ids=[],
+                qlogp_i8=b"",
+                credit_left=self._credit,
+                flags=0,
+            )
+            empty_path = torch.empty(0, dtype=torch.long, device=self._device)
+            return [bundle], start_pos, empty_path
+
+        # Reverse to go from shallowest to deepest along this path.
+        path_indices.reverse()
+        path_t = torch.tensor(path_indices, dtype=torch.long, device=self._device)
+
+        tok_ids = self._tree.tokens[path_t].tolist()
+        take = len(tok_ids)
+        # The parent absolute position is one before the first token in the chain.
+        start_pos = int(self._tree.positions[path_t[0]].item() - 1)
+
+        # (Optional) pack per-token qlogp as int8; for now we send zeros.
         qlogp = torch.zeros(take, dtype=torch.int8, device=self._device)
 
         self._bundle_id += 1
@@ -835,50 +839,74 @@ class SpecExecClient:
             credit_left=max_total_len - take,
             flags=0,
         )
-        return [bundle], start_pos
+        return [bundle], start_pos, path_t
 
-    def _apply_dasd_accept(self, resp: "specedge_pb2.ValidateResponseV2", start_pos: int) -> torch.Tensor:
+    def _apply_dasd_accept(
+        self,
+        resp: "specedge_pb2.ValidateResponseV2",
+        start_pos: int,
+        path_indices: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Convert accept bitmap to indices, reorder, then append one *real* next token.
+        Apply DASD accept bitmap along a linear path by reconstructing a V1-style selection vector,
+        and delegate to _apply_selection_like_v1 so token ordering matches the validated path.
         """
-        bm = resp.accept_bitmap  # bytes
-        if not bm:
-            # Nothing accepted: no reorder, just append next token via model
+        # If there was no path for this round, just advance the base model.
+        if path_indices.numel() == 0 or not resp.accept_bitmap:
             return self._append_model_next_token()
 
-        # Unpack bitmap (LSB-first) and trim to L = last_accepted_pos - start_pos
+        # Decode resp.accept_bitmap (LSB-first per byte) into bits
         bits: List[int] = []
-        for b in bm:
+        for b in resp.accept_bitmap:
             for k in range(8):
                 bits.append((b >> k) & 1)
-        L = max(0, resp.last_accepted_pos - start_pos)
+
+        self._logger.info(f"accept_bitmap: {bits}")
+        L = min(len(bits), path_indices.numel())
         bits = bits[:L]
         if L == 0:
             return self._append_model_next_token()
-        bits_t = torch.tensor(bits, device=self._device, dtype=torch.bool)
 
-        # Rebuild the current segment used to form the bundle (left-to-right)
-        mask = (self._tree.status[: self._tree.end] >= self._tree.PROCESSED)
-        mask[: self._tree.prefix_len] = False
-        cand_idx = torch.where(mask)[0]
-        pos = self._tree.positions[cand_idx]
-        order = torch.argsort(pos)
-        ordered = cand_idx[order]
-        seg = ordered[:L]
-        accepted = seg[bits_t]
+        # Build target_token_map_bool: True for all indices in path_indices[:L], else False
+        target_token_map_bool = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        if L > 0:
+            target_token_map_bool[path_indices[:L]] = True
 
-        # Sequence mask with accepted tokens
-        seq_mask = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
-        seq_mask[: self._tree.prefix_len] = True
-        seq_mask[accepted] = True
+        # Compute target_parent_indices and parent_pos_unique (sorted)
+        target_parent_indices = self._tree.parents[: self._tree.end][target_token_map_bool]
+        parent_pos_unique = torch.unique(target_parent_indices, sorted=True)
 
-        # Reorder and extract fresh
-        self._reorder_by_sequence(seq_mask)
-        fresh_token_ids = self._tree.tokens[self._tree.prefix_len : self._tree.end]
+        # Build input_token_map_bool: True at parent_pos_unique positions
+        input_token_map_bool = torch.zeros(self._tree.end, dtype=torch.bool, device=self._device)
+        if parent_pos_unique.numel() > 0:
+            input_token_map_bool[parent_pos_unique] = True
 
-        # Append one real next token
-        next_token = self._append_model_next_token()
-        if fresh_token_ids.numel() == 0:
-            return next_token
-        else:
-            return torch.cat([fresh_token_ids.unsqueeze(0), next_token], dim=-1)
+        # Allocate selection and mapping from parent position to slot index
+        selection = torch.empty((1, parent_pos_unique.numel()), dtype=torch.long, device=self._device)
+        pos_to_slot = {int(p): i for i, p in enumerate(parent_pos_unique.tolist())}
+        # Initialize with a default "reject" token: eos_token_id
+        selection.fill_(self._tokenizer.eos_token_id)
+
+        vocab_size = getattr(self._tokenizer, "vocab_size", 65536)
+        # For each i in range(L), set selection[0, slot] = tok if bits[i]==1
+        for i in range(L):
+            idx = int(path_indices[i].item())
+            parent = int(self._tree.parents[idx].item())
+            slot = pos_to_slot.get(parent)
+            if slot is None:
+                continue
+            tok = int(self._tree.tokens[idx].item())
+            if bits[i] == 1:
+                # If default token happens to equal tok, change it to something else for rejects
+                if selection[0, slot] == tok:
+                    # Change reject token to (tok + 1) % vocab_size
+                    selection[0, slot] = (tok + 1) % vocab_size
+                selection[0, slot] = tok
+            else:
+                # Leave as default reject token, but ensure it differs from tok
+                if selection[0, slot] == tok:
+                    selection[0, slot] = (tok + 1) % vocab_size
+
+        # Delegate to _apply_selection_like_v1
+        fresh = self._apply_selection_like_v1(selection, input_token_map_bool, target_token_map_bool)
+        return fresh
